@@ -4,3 +4,7 @@ out
 .env
 .env.*
 .DS_Store
+
+# ignore big static assets (uploaded via FTP on server)
+public/assets/
+Archivio.zip
