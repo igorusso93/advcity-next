@@ -1,19 +1,20 @@
-const { spawn } = require("child_process");
-const path = require("path");
+const http = require("http");
+const next = require("next");
 
-if (!process.env.PORT) {
+const port = process.env.PORT;
+if (!port) {
   console.error("ERROR: PORT env var is missing (Passenger should provide it).");
   process.exit(1);
 }
 
-const port = Number(process.env.PORT);
-const nodeBin = process.execPath;
-const nextCli = path.join(__dirname, "node_modules", "next", "dist", "bin", "next");
+const app = next({ dev: false });
+const handle = app.getRequestHandler();
 
-const child = spawn(
-  nodeBin,
-  [nextCli, "start", "-p", String(port), "-H", "0.0.0.0"],
-  { stdio: "inherit", env: process.env }
-);
-
-child.on("close", (code) => process.exit(code));
+app.prepare().then(() => {
+  http.createServer((req, res) => handle(req, res)).listen(port, "0.0.0.0", () => {
+    console.log(`Next.js listening on port ${port}`);
+  });
+}).catch((err) => {
+  console.error("Failed to start Next.js:", err);
+  process.exit(1);
+});
