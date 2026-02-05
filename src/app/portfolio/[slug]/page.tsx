@@ -1,4 +1,3 @@
-// src/app/portfolio/[slug]/page.tsx
 import SiteShell from "@/components/SiteShell";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -9,6 +8,7 @@ type WPMedia = {
   id?: number;
   source_url?: string;
   alt_text?: string;
+  mime_type?: string;
   media_details?: {
     sizes?: Record<string, { source_url: string }>;
   };
@@ -20,14 +20,18 @@ type WPPortfolio = {
   id: number;
   slug: string;
   title?: { rendered?: string };
-  content?: { rendered?: string };
-  date?: string;
-  menu_order?: number;
   acf?: any;
   _embedded?: {
     "wp:featuredmedia"?: WPMedia[];
     "wp:term"?: WPTerm[][];
   };
+};
+
+type HeroMedia = {
+  url: string | null;
+  alt: string;
+  mime?: string;
+  kind?: "image" | "video";
 };
 
 function stripHtml(html: string) {
@@ -39,9 +43,9 @@ function htmlSafe(html?: string) {
 }
 
 /**
- * Normalizza URL immagini:
+ * Normalizza URL media:
  * - se è relativo (/wp-content/...) => aggiunge base WP
- * - se è http => forza https (per evitare mixed content)
+ * - se è protocol-relative (//...) => aggiunge https:
  */
 function normalizeMediaUrl(url: string | null | undefined): string | null {
   if (!url) return null;
@@ -49,9 +53,9 @@ function normalizeMediaUrl(url: string | null | undefined): string | null {
   const clean = String(url).trim();
   if (!clean) return null;
 
-  const httpsUrl = clean.replace(/^http:\/\//i, "https://");
+  if (clean.startsWith("//")) return `https:${clean}`;
 
-  if (httpsUrl.startsWith("/")) {
+  if (clean.startsWith("/")) {
     const wpBase =
       process.env.NEXT_PUBLIC_WP_URL ||
       process.env.WP_URL ||
@@ -59,47 +63,40 @@ function normalizeMediaUrl(url: string | null | undefined): string | null {
       "";
 
     const base = wpBase.replace(/\/+$/, "");
-    return base ? `${base}${httpsUrl}` : httpsUrl;
+    return base ? `${base}${clean}` : clean;
   }
 
-  return httpsUrl;
+  return clean;
 }
 
-/**
- * ACF Image può tornare:
- * - oggetto/array (Return Format = Array)
- * - ID numero (Return Format = ID)
- * - stringa URL (Return Format = URL)
- *
- * Qui NON risolviamo l'ID (lo facciamo dopo con fetchMediaById).
- */
-function pickAcfImage(imageField: any): { url: string | null; alt: string } {
-  if (!imageField) return { url: null, alt: "" };
+function detectKindFromUrl(url: string | null, mime?: string): "image" | "video" | null {
+  if (!url) return null;
 
-  // Return format: URL (stringa)
-  if (typeof imageField === "string") {
-    return { url: normalizeMediaUrl(imageField), alt: "" };
+  const m = (mime || "").toLowerCase();
+  if (m.startsWith("video/")) return "video";
+  if (m.startsWith("image/")) return "image";
+
+  const clean = url.split("?")[0].toLowerCase();
+  if (clean.endsWith(".mp4") || clean.endsWith(".webm") || clean.endsWith(".ogg")) return "video";
+  if (
+    clean.endsWith(".jpg") ||
+    clean.endsWith(".jpeg") ||
+    clean.endsWith(".png") ||
+    clean.endsWith(".webp") ||
+    clean.endsWith(".gif")
+  )
+    return "image";
+
+  return null;
+}
+
+function pickIndustry(post: WPPortfolio): string | null {
+  const termsGroups = post._embedded?.["wp:term"] || [];
+  for (const group of termsGroups) {
+    const t = group?.find((x) => x.taxonomy === "industry");
+    if (t) return t.name;
   }
-
-  // Return format: ID (numero)
-  if (typeof imageField === "number") {
-    return { url: null, alt: "" };
-  }
-
-  // Return format: Object / Array
-  if (typeof imageField === "object") {
-    const rawUrl =
-      imageField?.sizes?.large ||
-      imageField?.sizes?.medium_large ||
-      imageField?.url ||
-      imageField?.source_url ||
-      null;
-
-    const alt = imageField?.alt || imageField?.alt_text || imageField?.title || "";
-    return { url: normalizeMediaUrl(rawUrl), alt };
-  }
-
-  return { url: null, alt: "" };
+  return null;
 }
 
 function pickFeaturedFromEmbed(post: WPPortfolio): { url: string | null; alt: string } {
@@ -115,25 +112,82 @@ function pickFeaturedFromEmbed(post: WPPortfolio): { url: string | null; alt: st
   return { url: normalizeMediaUrl(rawUrl), alt: fm.alt_text || "" };
 }
 
-function pickIndustry(post: WPPortfolio): string | null {
-  const termsGroups = post._embedded?.["wp:term"] || [];
-  for (const group of termsGroups) {
-    const t = group?.find((x) => x.taxonomy === "industry");
-    if (t) return t.name;
-  }
-  return null;
+/** ✅ fetch media per ID (immagine o video) */
+async function fetchMediaById(id: number): Promise<HeroMedia> {
+  const { json } = await wpFetchSafe<any>(`/wp-json/wp/v2/media/${id}`);
+  if (!json) return { url: null, alt: "", mime: undefined, kind: undefined };
+
+  const rawUrl =
+    json?.media_details?.sizes?.large?.source_url ||
+    json?.media_details?.sizes?.full?.source_url ||
+    json?.source_url ||
+    null;
+
+  const url = normalizeMediaUrl(rawUrl);
+  const alt = json?.alt_text || "";
+  const mime = json?.mime_type || undefined;
+  const kind = (detectKindFromUrl(url, mime) || undefined) as any;
+
+  return { url, alt, mime, kind };
 }
 
-/** ✅ RISOLVE UNA MEDIA WP PARTENDO DA ID (ACF Return Format = ID) */
-async function fetchMediaById(id: number): Promise<{ url: string | null; alt: string }> {
-  try {
-    const { json } = await wpFetchSafe<any>(`/wp-json/wp/v2/media/${id}`);
-    const rawUrl = json?.media_details?.sizes?.large?.source_url || json?.source_url || null;
-    const alt = json?.alt_text || "";
-    return { url: normalizeMediaUrl(rawUrl), alt };
-  } catch {
-    return { url: null, alt: "" };
+/** ✅ Risolve un campo ACF immagine che può essere: URL string, Array/object, oppure ID number */
+async function resolveAcfImage(field: any): Promise<{ url: string | null; alt: string }> {
+  if (!field) return { url: null, alt: "" };
+
+  // Se è stringa URL
+  if (typeof field === "string") {
+    const u = field.trim();
+    if (!u) return { url: null, alt: "" };
+    return { url: normalizeMediaUrl(u), alt: "" };
   }
+
+  // Se è ID
+  if (typeof field === "number") {
+    const m = await fetchMediaById(field);
+    return { url: m.url, alt: m.alt || "" };
+  }
+
+  // Se è object/array (return format array)
+  if (typeof field === "object") {
+    const rawUrl =
+      field?.sizes?.large ||
+      field?.sizes?.medium_large ||
+      field?.url ||
+      field?.source_url ||
+      field?.guid ||
+      null;
+
+    const alt = field?.alt || field?.alt_text || field?.title || "";
+    return { url: normalizeMediaUrl(rawUrl), alt };
+  }
+
+  return { url: null, alt: "" };
+}
+
+/** ✅ Risolve hero_media (file) che nel tuo JSON è ID (es: 42) */
+async function resolveHeroMedia(field: any): Promise<HeroMedia> {
+  if (!field) return { url: null, alt: "", mime: undefined, kind: undefined };
+
+  if (typeof field === "number") {
+    return await fetchMediaById(field);
+  }
+
+  if (typeof field === "string") {
+    const url = normalizeMediaUrl(field);
+    return { url, alt: "", mime: undefined, kind: detectKindFromUrl(url, undefined) || undefined };
+  }
+
+  if (typeof field === "object") {
+    const rawUrl = field?.url || field?.source_url || field?.guid || null;
+    const url = normalizeMediaUrl(rawUrl);
+    const alt = field?.alt || field?.alt_text || field?.title || "";
+    const mime = field?.mime_type || field?.mime || field?.type || undefined;
+    const kind = (detectKindFromUrl(url, mime) || undefined) as any;
+    return { url, alt, mime, kind };
+  }
+
+  return { url: null, alt: "", mime: undefined, kind: undefined };
 }
 
 /* =========================
@@ -151,7 +205,6 @@ const fetchPortfolioIndex = cache(async (): Promise<{ slug: string }[]> => {
     const tryMenuOrder = await wpFetchSafe<WPPortfolio[]>(
       `/wp-json/wp/v2/portfolio?per_page=100&_fields=slug,menu_order,date&orderby=menu_order&order=asc`
     );
-
     if (Array.isArray(tryMenuOrder.json) && tryMenuOrder.json.length) {
       return tryMenuOrder.json.map((x) => ({ slug: x.slug }));
     }
@@ -166,95 +219,6 @@ const fetchPortfolioIndex = cache(async (): Promise<{ slug: string }[]> => {
     return [];
   }
 });
-
-function renderBlocks(blocks: any[]) {
-  if (!Array.isArray(blocks) || blocks.length === 0) return null;
-
-  return blocks.map((b, idx) => {
-    const layout = b?.acf_fc_layout;
-
-    // 1) Immagine singola
-    if (layout === "single_image" || layout === "immagine_singola" || layout === "image_single") {
-      const { url, alt } = pickAcfImage(b.image);
-      if (!url) return null;
-      const speed = b.speed || "0.5";
-
-      return (
-        <div className="block-thumb" key={`blk-${idx}`}>
-          <img src={url} alt={alt || "Portfolio Image"} data-speed={speed} />
-        </div>
-      );
-    }
-
-    // 2) Gallery 2 immagini
-    if (layout === "gallery_two" || layout === "gallery_2" || layout === "gallery_two_images") {
-      const i1 = pickAcfImage(b.image_1);
-      const i2 = pickAcfImage(b.image_2);
-      if (!i1.url && !i2.url) return null;
-
-      return (
-        <div className="block-gallery" key={`blk-${idx}`}>
-          {i1.url ? <img src={i1.url} alt={i1.alt || "Portfolio Image"} /> : null}
-          {i2.url ? <img src={i2.url} alt={i2.alt || "Portfolio Image"} /> : null}
-        </div>
-      );
-    }
-
-    // 3) 2 immagini + testo
-    if (layout === "two_images_text" || layout === "img_text" || layout === "two_images_plus_text") {
-      const i1 = pickAcfImage(b.image_1);
-      const i2 = pickAcfImage(b.image_2);
-      const text = b.text;
-
-      return (
-        <div className="block-img-text" key={`blk-${idx}`}>
-          {i1.url ? <img src={i1.url} alt={i1.alt || "Portfolio Image"} /> : null}
-          {i2.url ? <img src={i2.url} alt={i2.alt || "Portfolio Image"} /> : null}
-          {text ? (
-            typeof text === "string" && text.includes("<") ? (
-              <p dangerouslySetInnerHTML={htmlSafe(text)} />
-            ) : (
-              <p>{String(text)}</p>
-            )
-          ) : null}
-        </div>
-      );
-    }
-
-    // 4) Testo
-    if (layout === "text" || layout === "testo" || layout === "rich_text") {
-      const title = b.title;
-      const text = b.text;
-
-      return (
-        <div className="block-content" key={`blk-${idx}`}>
-          <div className="row">
-            <div className="col-xxl-5 col-xl-5 col-lg-5 col-md-5">
-              {title ? (
-                <h2 className="portfolio__detail-title title-anim">
-                  {typeof title === "string" ? title : String(title)}
-                </h2>
-              ) : null}
-            </div>
-            <div className="col-xxl-7 col-xl-7 col-lg-7 col-md-7">
-              <div className="portfolio__detail-text">
-                {text ? (
-                  typeof text === "string" && text.includes("<") ? (
-                    <div dangerouslySetInnerHTML={htmlSafe(text)} />
-                  ) : (
-                    <p>{String(text)}</p>
-                  )
-                ) : null}
-              </div>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    return null;
-  });
-}
 
 export default async function PortfolioDetailPage({
   params,
@@ -272,19 +236,29 @@ export default async function PortfolioDetailPage({
   const year = acf.year ?? "";
   const client = acf.client ?? "";
   const intro = acf.intro ?? "";
-  const servicesList: any[] = Array.isArray(acf.services_list) ? acf.services_list : [];
+  const headline = acf.headline ?? "";
+  const finalText = acf.final_text ?? "";
 
   const industry = pickIndustry(post) || acf.industry_text || null;
 
-  // ✅ Banner: risolvo hero_image anche se è ID
-  const featured = pickFeaturedFromEmbed(post);
+  // ✅ Services list (nel tuo JSON è array stringhe)
+  const servicesFromSelect: string[] = Array.isArray(acf.services_list) ? acf.services_list : [];
 
-  let hero = pickAcfImage(acf.hero_image);
-  if (!hero.url && typeof acf.hero_image === "number") {
-    hero = await fetchMediaById(acf.hero_image);
-  }
+  // ✅ Hero media (ID -> fetch media)
+  const featured = pickFeaturedFromEmbed(post);
+  const hero = await resolveHeroMedia(acf.hero_media);
 
   const bannerUrl = hero.url || featured.url || null;
+  const bannerKind: "image" | "video" =
+    (hero.kind || detectKindFromUrl(bannerUrl, hero.mime) || "image") as any;
+
+  // ✅ Gallery: nel tuo JSON sono ID (es: 71) -> fetch media
+  const gA = await resolveAcfImage(acf.gallery_a_image);
+  const gB1 = await resolveAcfImage(acf.gallery_b_image_1);
+  const gB2 = await resolveAcfImage(acf.gallery_b_image_2);
+  const gC = await resolveAcfImage(acf.gallery_c_image);
+  const gD1 = await resolveAcfImage(acf.gallery_d_image_1);
+  const gD2 = await resolveAcfImage(acf.gallery_d_image_2);
 
   // Prev/Next
   const indexList = await fetchPortfolioIndex();
@@ -294,8 +268,6 @@ export default async function PortfolioDetailPage({
     currentIndex >= 0 && currentIndex < indexList.length - 1
       ? indexList[currentIndex + 1]?.slug
       : null;
-
-  const blocks = Array.isArray(acf.content_blocks) ? acf.content_blocks : [];
 
   return (
     <SiteShell>
@@ -342,10 +314,23 @@ export default async function PortfolioDetailPage({
             </div>
           </div>
 
-          {/* Banner */}
+          {/* Banner (IMG o VIDEO) */}
           {bannerUrl ? (
             <div className="portfolio__detail-thumb">
-              <img src={bannerUrl} alt={hero.alt || featured.alt || title} data-speed="auto" />
+              {bannerKind === "video" ? (
+                <video
+                  autoPlay
+                  muted
+                  loop
+                  playsInline
+                  preload="metadata"
+                  style={{ width: "100%", height: "auto", display: "block" }}
+                >
+                  <source src={bannerUrl} />
+                </video>
+              ) : (
+                <img src={bannerUrl} alt={hero.alt || featured.alt || title} data-speed="auto" />
+              )}
             </div>
           ) : null}
 
@@ -354,12 +339,12 @@ export default async function PortfolioDetailPage({
             <div className="container g-0 line pt-140">
               <span className="line-3"></span>
 
-              {/* Intro */}
+              {/* Intro + servizi */}
               <div className="block-content">
                 <div className="row">
                   <div className="col-xxl-5 col-xl-5 col-lg-5 col-md-5">
                     <h2 className="portfolio__detail-title title-anim">
-                      {acf.headline ? String(acf.headline) : "Il progetto"}
+                      {headline ? String(headline) : "Il progetto"}
                     </h2>
                   </div>
 
@@ -367,12 +352,11 @@ export default async function PortfolioDetailPage({
                     <div className="portfolio__detail-text">
                       {intro ? <p>{String(intro)}</p> : null}
 
-                      {servicesList.length > 0 ? (
+                      {servicesFromSelect.length > 0 ? (
                         <ul>
-                          {servicesList.map((s, i) => {
-                            const val = typeof s === "string" ? s : s?.item;
-                            return <li key={`srv-${i}`}>{String(val || "")}</li>;
-                          })}
+                          {servicesFromSelect.map((s, i) => (
+                            <li key={`srv-${i}`}>{String(s)}</li>
+                          ))}
                         </ul>
                       ) : null}
                     </div>
@@ -380,7 +364,46 @@ export default async function PortfolioDetailPage({
                 </div>
               </div>
 
-              {renderBlocks(blocks)}
+              {/* 1 immagine */}
+              {gA.url ? (
+                <div className="block-thumb">
+                  <img src={gA.url} alt={gA.alt || "Portfolio Image"} data-speed="auto" />
+                </div>
+              ) : null}
+
+              {/* 2 immagini */}
+              {gB1.url || gB2.url ? (
+                <div className="block-gallery">
+                  {gB1.url ? <img src={gB1.url} alt={gB1.alt || "Portfolio Image"} /> : null}
+                  {gB2.url ? <img src={gB2.url} alt={gB2.alt || "Portfolio Image"} /> : null}
+                </div>
+              ) : null}
+
+              {/* 1 immagine */}
+              {gC.url ? (
+                <div className="block-thumb">
+                  <img src={gC.url} alt={gC.alt || "Portfolio Image"} data-speed="auto" />
+                </div>
+              ) : null}
+
+              {/* 2 immagini */}
+              {gD1.url || gD2.url ? (
+                <div className="block-gallery">
+                  {gD1.url ? <img src={gD1.url} alt={gD1.alt || "Portfolio Image"} /> : null}
+                  {gD2.url ? <img src={gD2.url} alt={gD2.alt || "Portfolio Image"} /> : null}
+                </div>
+              ) : null}
+
+              {/* Testo finale */}
+              {finalText ? (
+                <div className="block-content">
+                  {typeof finalText === "string" && finalText.includes("<") ? (
+                    <div dangerouslySetInnerHTML={htmlSafe(finalText)} />
+                  ) : (
+                    <p>{String(finalText)}</p>
+                  )}
+                </div>
+              ) : null}
 
               {/* Prev/Next */}
               <div className="row">
