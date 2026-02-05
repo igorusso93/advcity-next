@@ -1,18 +1,16 @@
 const { spawn } = require("child_process");
 const path = require("path");
 
-const port = process.env.PORT || 3000;
-
-// Next CLI reale (no npx, no .bin shim)
+const port = process.env.PORT ? Number(process.env.PORT) : 0; // 0 = porta libera automatica
+const nodeBin = process.execPath;
 const nextCli = path.join(__dirname, "node_modules", "next", "dist", "bin", "next");
 
-// Usa il node dell'ambiente (stesso che esegue Passenger)
-const nodeBin = process.execPath;
+const args = ["start", "-H", "0.0.0.0"];
+if (port !== 0) args.push("-p", String(port));
 
-const child = spawn(
-  nodeBin,
-  [nextCli, "start", "-p", String(port), "-H", "0.0.0.0"],
-  { stdio: "inherit", env: process.env }
-);
+const child = spawn(nodeBin, [nextCli, ...args], {
+  stdio: "inherit",
+  env: process.env,
+});
 
 child.on("close", (code) => process.exit(code));
